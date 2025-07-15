@@ -65,30 +65,65 @@ pub(crate) struct BlockValidationMetrics {
     pub(crate) state_root_storage_tries_updated_total: Counter,
     /// Total number of times the parallel state root computation fell back to regular.
     pub(crate) state_root_parallel_fallback_total: Counter,
-    /// Histogram of state root duration
-    pub(crate) state_root_histogram: Histogram,
-    /// Latest state root duration
-    pub(crate) state_root_duration: Gauge,
     /// Trie input computation duration
     pub(crate) trie_input_duration: Histogram,
 
     /// Total number of background parallel state root tasks (historical cumulative)
+    #[allow(dead_code)]
     pub background_parallel_state_root_tasks: Counter,
     /// Total number of foreground parallel state root tasks (historical cumulative)
+    #[allow(dead_code)]
     pub foreground_parallel_state_root_tasks: Counter,
     /// Total number of background cache tasks (historical cumulative)
+    #[allow(dead_code)]
     pub background_cache_tasks: Counter,
     /// Total number of foreground sync state root computations (historical cumulative)
+    #[allow(dead_code)]
     pub faillback_sync_state_root_tasks: Counter,
+
+    /// Live Sync Performance Metrics - Key Performance Indicators
+    /// FCU end-to-end processing duration
+    pub live_sync_fcu_duration: Histogram,
+    /// Block execution duration during live sync
+    pub live_sync_block_execution_duration: Histogram,
+    /// State root computation duration (parallel)
+    pub live_sync_state_root_parallel_duration: Histogram,
+    /// State root computation duration (serial)
+    pub live_sync_state_root_serial_duration: Histogram,
+    /// Block insertion duration
+    pub live_sync_block_insert_duration: Histogram,
+
+    /// Performance Overview Metrics
+    /// Hash computations during state root calculation
+    pub live_sync_hash_computation_duration: Histogram,
+    /// Trie proof generation duration
+    pub live_sync_proof_generation_duration: Histogram,
+    /// Memory allocation/deallocation overhead during tree state operations
+    pub live_sync_memory_ops_duration: Histogram,
 }
 
 impl BlockValidationMetrics {
-    /// Records a new state root time, updating both the histogram and state root gauge
-    pub(crate) fn record_state_root(&self, trie_output: &TrieUpdates, elapsed_as_secs: f64) {
+    /// Records comprehensive state root computation metrics for live sync
+    /// This includes both the original metrics and the new live sync performance metrics
+    pub(crate) fn record_state_root(
+        &self,
+        trie_output: &TrieUpdates,
+        elapsed_as_secs: f64,
+        is_parallel: bool,
+    ) {
+        // Record storage tries count
         self.state_root_storage_tries_updated_total
             .increment(trie_output.storage_tries_ref().len() as u64);
-        self.state_root_duration.set(elapsed_as_secs);
-        self.state_root_histogram.record(elapsed_as_secs);
+
+        // Record live sync specific metrics
+        if is_parallel {
+            self.live_sync_state_root_parallel_duration.record(elapsed_as_secs);
+        } else {
+            self.live_sync_state_root_serial_duration.record(elapsed_as_secs);
+        }
+
+        // Record hash computation time (state root computation is primarily hash computation)
+        self.live_sync_hash_computation_duration.record(elapsed_as_secs);
     }
 }
 

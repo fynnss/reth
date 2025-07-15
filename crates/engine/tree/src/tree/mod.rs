@@ -10,7 +10,7 @@ use crate::{
 use alloy_consensus::BlockHeader;
 use alloy_eips::{BlockNumHash, NumHash};
 use alloy_evm::block::BlockExecutor;
-use alloy_primitives::{Address, B256};
+use alloy_primitives::B256;
 use alloy_rpc_types_engine::{
     ForkchoiceState, PayloadStatus, PayloadStatusEnum, PayloadValidationError,
 };
@@ -18,7 +18,7 @@ use error::{InsertBlockError, InsertBlockErrorKind, InsertBlockFatalError};
 use instrumented_state::InstrumentedStateProvider;
 use payload_processor::sparse_trie::StateRootComputeOutcome;
 use persistence_state::CurrentPersistenceAction;
-use precompile_cache::{CachedPrecompile, CachedPrecompileMetrics, PrecompileCacheMap};
+use precompile_cache::{CachedPrecompile, PrecompileCacheMap};
 use reth_chain_state::{
     CanonicalInMemoryState, ExecutedBlock, ExecutedBlockWithTrieUpdates, ExecutedTrieUpdates,
     MemoryOverlayStateProvider, NewCanonicalChain,
@@ -50,7 +50,6 @@ use reth_trie_parallel::root::{ParallelStateRoot, ParallelStateRootError};
 use state::TreeState;
 use std::{
     borrow::Cow,
-    collections::HashMap,
     fmt::Debug,
     sync::{
         mpsc::{Receiver, RecvError, RecvTimeoutError, Sender},
@@ -66,6 +65,8 @@ use tracing::*;
 
 mod block_buffer;
 mod cached_state;
+#[cfg(test)]
+mod e2e_tests;
 pub mod error;
 mod instrumented_state;
 mod invalid_block_hook;
@@ -275,8 +276,6 @@ where
     evm_config: C,
     /// Precompile cache map.
     precompile_cache_map: PrecompileCacheMap<SpecFor<C>>,
-    /// Metrics for precompile cache, stored per address to avoid re-allocation.
-    precompile_cache_metrics: HashMap<Address, CachedPrecompileMetrics>,
 }
 
 impl<N, P: Debug, T: PayloadTypes + Debug, V: Debug, C> std::fmt::Debug
@@ -371,7 +370,6 @@ where
             payload_processor,
             evm_config,
             precompile_cache_map,
-            precompile_cache_metrics: HashMap::new(),
         }
     }
 
@@ -830,6 +828,7 @@ where
         attrs: Option<T::PayloadAttributes>,
         version: EngineApiMessageVersion,
     ) -> ProviderResult<TreeOutcome<OnForkChoiceUpdated>> {
+        let fcu_start = std::time::Instant::now();
         trace!(target: "engine::tree", ?attrs, "invoked forkchoice update");
         self.metrics.engine.forkchoice_updated_messages.increment(1);
         self.canonical_in_memory_state.on_forkchoice_update_received();
@@ -866,6 +865,7 @@ where
             // update the safe and finalized blocks and ensure their values are valid
             if let Err(outcome) = self.ensure_consistent_forkchoice_state(state) {
                 // safe or finalized hashes are invalid
+                self.metrics.block_validation.live_sync_fcu_duration.record(fcu_start.elapsed());
                 return Ok(TreeOutcome::new(outcome))
             }
 
@@ -879,10 +879,12 @@ where
                         ProviderError::HeaderNotFound(state.head_block_hash.into())
                     })?;
                 let updated = self.process_payload_attributes(attr, tip.header(), state, version);
+                self.metrics.block_validation.live_sync_fcu_duration.record(fcu_start.elapsed());
                 return Ok(TreeOutcome::new(updated))
             }
 
             // the head block is already canonical
+            self.metrics.block_validation.live_sync_fcu_duration.record(fcu_start.elapsed());
             return Ok(valid_outcome(state.head_block_hash))
         }
 
@@ -900,6 +902,10 @@ where
                     debug!(target: "engine::tree", head = canonical_header.number(), "handling payload attributes for canonical head");
                     let updated =
                         self.process_payload_attributes(attr, &canonical_header, state, version);
+                    self.metrics
+                        .block_validation
+                        .live_sync_fcu_duration
+                        .record(fcu_start.elapsed().as_secs_f64());
                     return Ok(TreeOutcome::new(updated))
                 }
             }
@@ -913,25 +919,42 @@ where
 
             // the head block is already canonical, so we're not triggering a payload job and can
             // return right away
+            self.metrics
+                .block_validation
+                .live_sync_fcu_duration
+                .record(fcu_start.elapsed().as_secs_f64());
             return Ok(valid_outcome(state.head_block_hash))
         }
 
         // 3. ensure we can apply a new chain update for the head block
         if let Some(chain_update) = self.on_new_head(state.head_block_hash)? {
+            debug!(target: "engine::tree", "new head block is canonical");
             let tip = chain_update.tip().clone_sealed_header();
             self.on_canonical_chain_update(chain_update);
 
             // update the safe and finalized blocks and ensure their values are valid
             if let Err(outcome) = self.ensure_consistent_forkchoice_state(state) {
                 // safe or finalized hashes are invalid
+                self.metrics
+                    .block_validation
+                    .live_sync_fcu_duration
+                    .record(fcu_start.elapsed().as_secs_f64());
                 return Ok(TreeOutcome::new(outcome))
             }
 
             if let Some(attr) = attrs {
                 let updated = self.process_payload_attributes(attr, &tip, state, version);
+                self.metrics
+                    .block_validation
+                    .live_sync_fcu_duration
+                    .record(fcu_start.elapsed().as_secs_f64());
                 return Ok(TreeOutcome::new(updated))
             }
 
+            self.metrics
+                .block_validation
+                .live_sync_fcu_duration
+                .record(fcu_start.elapsed().as_secs_f64());
             return Ok(valid_outcome(state.head_block_hash))
         }
 
@@ -954,11 +977,18 @@ where
 
         let target = self.lowest_buffered_ancestor_or(target);
         trace!(target: "engine::tree", %target, "downloading missing block");
-
-        Ok(TreeOutcome::new(OnForkChoiceUpdated::valid(PayloadStatus::from_status(
+        let result = Ok(TreeOutcome::new(OnForkChoiceUpdated::valid(PayloadStatus::from_status(
             PayloadStatusEnum::Syncing,
         )))
-        .with_event(TreeEvent::Download(DownloadRequest::single_block(target))))
+        .with_event(TreeEvent::Download(DownloadRequest::single_block(target))));
+
+        // Record FCU duration
+        self.metrics
+            .block_validation
+            .live_sync_fcu_duration
+            .record(fcu_start.elapsed().as_secs_f64());
+
+        result
     }
 
     /// Attempts to receive the next engine request.
@@ -1340,6 +1370,7 @@ where
                 self.emit_event(EngineApiEvent::BackfillAction(action));
             }
             TreeEvent::Download(action) => {
+                debug!(target: "engine::tree", "emitting download action event");
                 self.emit_event(EngineApiEvent::Download(action));
             }
         }
@@ -1894,7 +1925,7 @@ where
     ///
     /// This is invoked on a valid forkchoice update, or if we can make the target block canonical.
     fn on_canonical_chain_update(&mut self, chain_update: NewCanonicalChain<N>) {
-        trace!(target: "engine::tree", new_blocks = %chain_update.new_block_count(), reorged_blocks =  %chain_update.reorged_block_count(), "applying new chain update");
+        debug!(target: "engine::tree", new_blocks = %chain_update.new_block_count(), reorged_blocks =  %chain_update.reorged_block_count(), "applying new chain update");
         let start = Instant::now();
 
         // update the tracked canonical head
@@ -2222,32 +2253,36 @@ where
                 Err(e) => return Err((InsertBlockErrorKind::Other(Box::new(e)), block)),
             };
 
+            let trie_input_elapsed = trie_input_start.elapsed();
             self.metrics
                 .block_validation
                 .trie_input_duration
-                .record(trie_input_start.elapsed().as_secs_f64());
+                .record(trie_input_elapsed.as_secs_f64());
 
             // Use state root task only if prefix sets are empty, otherwise proof generation is too
             // expensive because it requires walking over the paths in the prefix set in every
             // proof.
             if trie_input.prefix_sets.is_empty() {
-                self.metrics.block_validation.background_parallel_state_root_tasks.increment(1);
-                self.payload_processor.spawn(
+                let proof_gen_start = Instant::now();
+                let handle = self.payload_processor.spawn(
                     header,
                     txs,
                     provider_builder,
                     consistent_view,
                     trie_input,
                     &self.config,
-                )
+                );
+                // Record proof generation overhead
+                self.metrics
+                    .block_validation
+                    .live_sync_proof_generation_duration
+                    .record(proof_gen_start.elapsed().as_secs_f64());
+                handle
             } else {
-                debug!(target: "engine::tree", block=?block_num_hash, "Disabling state root task due to non-empty prefix sets");
                 use_state_root_task = false;
-                self.metrics.block_validation.background_cache_tasks.increment(1);
                 self.payload_processor.spawn_cache_exclusive(header, txs, provider_builder)
             }
         } else {
-            self.metrics.block_validation.background_cache_tasks.increment(1);
             self.payload_processor.spawn_cache_exclusive(header, txs, provider_builder)
         };
 
@@ -2259,6 +2294,7 @@ where
             handle.cache_metrics(),
         );
 
+        let execution_start = std::time::Instant::now();
         let (output, execution_finish) = if self.config.state_provider_metrics() {
             let state_provider = InstrumentedStateProvider::from_state_provider(&state_provider);
             let (output, execution_finish) =
@@ -2270,6 +2306,12 @@ where
                 ensure_ok!(self.execute_block(&state_provider, &block, &handle));
             (output, execution_finish)
         };
+
+        // Record block execution duration
+        self.metrics
+            .block_validation
+            .live_sync_block_execution_duration
+            .record(execution_start.elapsed().as_secs_f64());
 
         // after executing the block we can stop executing transactions
         handle.stop_prewarming_execution();
@@ -2301,9 +2343,8 @@ where
             // if we new payload extends the current canonical change we attempt to use the
             // background task or try to compute it in parallel
             if use_state_root_task {
-                debug!(target: "engine::tree", block=?block_num_hash, "Using sparse trie state root algorithm");
                 match handle.state_root() {
-                    Ok(StateRootComputeOutcome { state_root, trie_updates, trie }) => {
+                    Ok(StateRootComputeOutcome { state_root, trie_updates, trie: _ }) => {
                         let elapsed = execution_finish.elapsed();
                         info!(target: "engine::tree", ?state_root, ?elapsed, "State root task finished");
                         // we double check the state root here for good measure
@@ -2317,18 +2358,12 @@ where
                                 "State root task returned incorrect state root"
                             );
                         }
-
-                        // hold on to the sparse trie for the next payload
-                        self.payload_processor.set_sparse_trie(trie);
                     }
                     Err(error) => {
                         debug!(target: "engine::tree", %error, "Background parallel state root computation failed");
                     }
                 }
             } else {
-                debug!(target: "engine::tree", block=?block_num_hash, "Using parallel state root algorithm");
-                self.metrics.block_validation.foreground_parallel_state_root_tasks.increment(1);
-
                 match self.compute_state_root_parallel(
                     persisting_kind,
                     block.header().parent_hash(),
@@ -2351,13 +2386,13 @@ where
             }
         }
 
-        let (state_root, trie_output, root_elapsed) = if let Some(maybe_state_root) =
+        let (state_root, trie_output, root_elapsed, is_parallel) = if let Some(maybe_state_root) =
             maybe_state_root
         {
-            maybe_state_root
+            let (root, updates, elapsed) = maybe_state_root;
+            (root, updates, elapsed, true)
         } else {
             // fallback is to compute the state root regularly in sync
-            self.metrics.block_validation.faillback_sync_state_root_tasks.increment(1);
             if self.config.state_root_fallback() {
                 debug!(target: "engine::tree", block=?block_num_hash, "Using state root fallback for testing");
             } else {
@@ -2365,12 +2400,20 @@ where
                 self.metrics.block_validation.state_root_parallel_fallback_total.increment(1);
             }
 
+            let serial_start = std::time::Instant::now();
             let (root, updates) =
                 ensure_ok!(state_provider.state_root_with_updates(hashed_state.clone()));
-            (root, updates, root_time.elapsed())
+            let elapsed = serial_start.elapsed();
+
+            (root, updates, elapsed, false)
         };
 
-        self.metrics.block_validation.record_state_root(&trie_output, root_elapsed.as_secs_f64());
+        // Record comprehensive state root metrics (includes both original and live sync metrics)
+        self.metrics.block_validation.record_state_root(
+            &trie_output,
+            root_elapsed.as_secs_f64(),
+            is_parallel,
+        );
         debug!(target: "engine::tree", ?root_elapsed, block=?block_num_hash, "Calculated state root");
 
         // ensure state root matches
@@ -2414,8 +2457,23 @@ where
             self.canonical_in_memory_state.set_pending_block(executed.clone());
         }
 
+        let insert_start = std::time::Instant::now();
+
+        // Record memory operations during executed block creation
+        let memory_ops_start = std::time::Instant::now();
         self.state.tree_state.insert_executed(executed.clone());
+        self.metrics
+            .block_validation
+            .live_sync_memory_ops_duration
+            .record(memory_ops_start.elapsed().as_secs_f64());
+
         self.metrics.engine.executed_blocks.set(self.state.tree_state.block_count() as f64);
+
+        // Record overall block insertion duration
+        self.metrics
+            .block_validation
+            .live_sync_block_insert_duration
+            .record(insert_start.elapsed().as_secs_f64());
 
         // emit insert event
         let elapsed = start.elapsed();
@@ -2447,16 +2505,11 @@ where
 
         if !self.config.precompile_cache_disabled() {
             executor.evm_mut().precompiles_mut().map_precompiles(|address, precompile| {
-                let metrics = self
-                    .precompile_cache_metrics
-                    .entry(*address)
-                    .or_insert_with(|| CachedPrecompileMetrics::new_with_address(*address))
-                    .clone();
                 CachedPrecompile::wrap(
                     precompile,
                     self.precompile_cache_map.cache_for_address(*address),
                     *self.evm_config.evm_env(block.header()).spec_id(),
-                    Some(metrics),
+                    None,
                 )
             });
         }
