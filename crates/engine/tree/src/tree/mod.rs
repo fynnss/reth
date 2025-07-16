@@ -828,7 +828,6 @@ where
         attrs: Option<T::PayloadAttributes>,
         version: EngineApiMessageVersion,
     ) -> ProviderResult<TreeOutcome<OnForkChoiceUpdated>> {
-        let fcu_start = std::time::Instant::now();
         trace!(target: "engine::tree", ?attrs, "invoked forkchoice update");
         self.metrics.engine.forkchoice_updated_messages.increment(1);
         self.canonical_in_memory_state.on_forkchoice_update_received();
@@ -865,7 +864,6 @@ where
             // update the safe and finalized blocks and ensure their values are valid
             if let Err(outcome) = self.ensure_consistent_forkchoice_state(state) {
                 // safe or finalized hashes are invalid
-                self.metrics.block_validation.live_sync_fcu_duration.record(fcu_start.elapsed());
                 return Ok(TreeOutcome::new(outcome))
             }
 
@@ -879,12 +877,10 @@ where
                         ProviderError::HeaderNotFound(state.head_block_hash.into())
                     })?;
                 let updated = self.process_payload_attributes(attr, tip.header(), state, version);
-                self.metrics.block_validation.live_sync_fcu_duration.record(fcu_start.elapsed());
                 return Ok(TreeOutcome::new(updated))
             }
 
             // the head block is already canonical
-            self.metrics.block_validation.live_sync_fcu_duration.record(fcu_start.elapsed());
             return Ok(valid_outcome(state.head_block_hash))
         }
 
@@ -902,10 +898,6 @@ where
                     debug!(target: "engine::tree", head = canonical_header.number(), "handling payload attributes for canonical head");
                     let updated =
                         self.process_payload_attributes(attr, &canonical_header, state, version);
-                    self.metrics
-                        .block_validation
-                        .live_sync_fcu_duration
-                        .record(fcu_start.elapsed().as_secs_f64());
                     return Ok(TreeOutcome::new(updated))
                 }
             }
@@ -919,10 +911,6 @@ where
 
             // the head block is already canonical, so we're not triggering a payload job and can
             // return right away
-            self.metrics
-                .block_validation
-                .live_sync_fcu_duration
-                .record(fcu_start.elapsed().as_secs_f64());
             return Ok(valid_outcome(state.head_block_hash))
         }
 
@@ -935,26 +923,14 @@ where
             // update the safe and finalized blocks and ensure their values are valid
             if let Err(outcome) = self.ensure_consistent_forkchoice_state(state) {
                 // safe or finalized hashes are invalid
-                self.metrics
-                    .block_validation
-                    .live_sync_fcu_duration
-                    .record(fcu_start.elapsed().as_secs_f64());
                 return Ok(TreeOutcome::new(outcome))
             }
 
             if let Some(attr) = attrs {
                 let updated = self.process_payload_attributes(attr, &tip, state, version);
-                self.metrics
-                    .block_validation
-                    .live_sync_fcu_duration
-                    .record(fcu_start.elapsed().as_secs_f64());
                 return Ok(TreeOutcome::new(updated))
             }
 
-            self.metrics
-                .block_validation
-                .live_sync_fcu_duration
-                .record(fcu_start.elapsed().as_secs_f64());
             return Ok(valid_outcome(state.head_block_hash))
         }
 
@@ -981,12 +957,6 @@ where
             PayloadStatusEnum::Syncing,
         )))
         .with_event(TreeEvent::Download(DownloadRequest::single_block(target))));
-
-        // Record FCU duration
-        self.metrics
-            .block_validation
-            .live_sync_fcu_duration
-            .record(fcu_start.elapsed().as_secs_f64());
 
         result
     }
@@ -2123,10 +2093,8 @@ where
         &mut self,
         block: RecoveredBlock<N::Block>,
     ) -> Result<InsertPayloadOk, InsertBlockError<N::Block>> {
-        match self.insert_block_inner(block) {
-            Ok(result) => Ok(result),
-            Err((kind, block)) => Err(InsertBlockError::new(block.into_sealed_block(), kind)),
-        }
+        self.insert_block_inner(block)
+            .map_err(|(kind, block)| InsertBlockError::new(block.into_sealed_block(), kind))
     }
 
     fn insert_block_inner(
@@ -2143,6 +2111,7 @@ where
             };
         }
 
+        let total_start = std::time::Instant::now();
         let block_num_hash = block.num_hash();
         debug!(target: "engine::tree", block=?block_num_hash, parent = ?block.parent_hash(), state_root = ?block.state_root(), "Inserting new block into tree");
 
@@ -2485,6 +2454,13 @@ where
         self.emit_event(EngineApiEvent::BeaconConsensus(engine_event));
 
         debug!(target: "engine::tree", block=?block_num_hash, "Finished inserting block");
+        
+        // Record overall block processing duration for successful insertions
+        self.metrics
+            .block_validation
+            .live_sync_block_total_duration
+            .record(total_start.elapsed().as_secs_f64());
+            
         Ok(InsertPayloadOk::Inserted(BlockStatus::Valid))
     }
 

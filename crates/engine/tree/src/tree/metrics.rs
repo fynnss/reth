@@ -82,8 +82,8 @@ pub(crate) struct BlockValidationMetrics {
     pub faillback_sync_state_root_tasks: Counter,
 
     /// Live Sync Performance Metrics - Key Performance Indicators
-    /// FCU end-to-end processing duration
-    pub live_sync_fcu_duration: Histogram,
+    /// Overall block processing duration (from start to finish)
+    pub live_sync_block_total_duration: Histogram,
     /// Block execution duration during live sync
     pub live_sync_block_execution_duration: Histogram,
     /// State root computation duration (parallel)

@@ -6,17 +6,30 @@
 
 ```
 on_forkchoice_updated()
-├── Start: fcu_start = Instant::now()
 ├── Pre-validation and state checks
 ├── Head block validation
 ├── Canonical chain updates
-├── Payload attributes processing (if applicable)
-└── End: live_sync_fcu_duration.record(fcu_start.elapsed())
+└── Payload attributes processing (if applicable)
 ```
 
-**Primary Metric**: `live_sync_fcu_duration` - Records the complete FCU processing time
+### 2. Overall Block Processing Flow (insert_block)
 
-### 2. Block Insertion Flow (insert_block_inner)
+```
+insert_block()
+├── Start: total_start = Instant::now()
+├── Call insert_block_inner()
+│   ├── Block validation and consensus checks
+│   ├── State provider building
+│   ├── Trie input computation
+│   ├── Proof generation (if applicable)
+│   ├── Block execution
+│   ├── State root computation
+│   └── Block insertion into tree
+├── End: live_sync_block_total_duration.record(total_start.elapsed())
+└── Return result
+```
+
+### 3. Block Insertion Flow (insert_block_inner)
 
 ```
 insert_block_inner()
@@ -66,7 +79,7 @@ record_state_root()
 
 ### 1. Core Flow Metrics
 
--   **`live_sync_fcu_duration`** - ForkchoiceUpdated end-to-end processing time
+-   **`live_sync_block_total_duration`** - Overall block processing time (from start to finish)
 -   **`live_sync_block_execution_duration`** - Block execution time
 -   **`live_sync_state_root_parallel_duration`** - Parallel state root computation time
 -   **`live_sync_state_root_serial_duration`** - Serial state root computation time (fallback)
