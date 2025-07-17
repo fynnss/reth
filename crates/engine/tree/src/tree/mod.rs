@@ -2232,7 +2232,6 @@ where
             // expensive because it requires walking over the paths in the prefix set in every
             // proof.
             if trie_input.prefix_sets.is_empty() {
-                let proof_gen_start = Instant::now();
                 let handle = self.payload_processor.spawn(
                     header,
                     txs,
@@ -2241,11 +2240,6 @@ where
                     trie_input,
                     &self.config,
                 );
-                // Record proof generation overhead
-                self.metrics
-                    .block_validation
-                    .live_sync_proof_generation_duration
-                    .record(proof_gen_start.elapsed().as_secs_f64());
                 handle
             } else {
                 use_state_root_task = false;
@@ -2278,10 +2272,11 @@ where
 
         // Record block execution duration
         self.metrics
-            .block_validation
-            .live_sync_block_execution_duration
+            .engine
+            .block_execution_duration
             .record(execution_start.elapsed().as_secs_f64());
 
+        let validation_start = std::time::Instant::now();
         // after executing the block we can stop executing transactions
         handle.stop_prewarming_execution();
 
@@ -2398,6 +2393,7 @@ where
             ))
         }
 
+        self.metrics.engine.block_validation_duration.record(validation_start.elapsed().as_secs_f64());
         // terminate prewarming task with good state output
         handle.terminate_caching(Some(output.state.clone()));
 
@@ -2426,23 +2422,10 @@ where
             self.canonical_in_memory_state.set_pending_block(executed.clone());
         }
 
-        let insert_start = std::time::Instant::now();
-
         // Record memory operations during executed block creation
-        let memory_ops_start = std::time::Instant::now();
         self.state.tree_state.insert_executed(executed.clone());
-        self.metrics
-            .block_validation
-            .live_sync_memory_ops_duration
-            .record(memory_ops_start.elapsed().as_secs_f64());
 
         self.metrics.engine.executed_blocks.set(self.state.tree_state.block_count() as f64);
-
-        // Record overall block insertion duration
-        self.metrics
-            .block_validation
-            .live_sync_block_insert_duration
-            .record(insert_start.elapsed().as_secs_f64());
 
         // emit insert event
         let elapsed = start.elapsed();
@@ -2457,8 +2440,8 @@ where
         
         // Record overall block processing duration for successful insertions
         self.metrics
-            .block_validation
-            .live_sync_block_total_duration
+            .engine
+            .block_total_duration
             .record(total_start.elapsed().as_secs_f64());
             
         Ok(InsertPayloadOk::Inserted(BlockStatus::Valid))
@@ -2911,7 +2894,7 @@ where
 /// Block inclusion can be valid, accepted, or invalid. Invalid blocks are returned as an error
 /// variant.
 ///
-/// If we don't know the block's parent, we return `Disconnected`, as we can't claim that the block
+/// If we don't know the block's parent, we return `Disconnected`, as we can't claim that the block
 /// is valid or not.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum BlockStatus {
